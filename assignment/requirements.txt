@@ -2,9 +2,10 @@ fastapi
 uvicorn
 pydantic
 pydantic-settings
-pydantic-ai
+pydantic-ai>=0.0.25
 openai
 httpx
 python-multipart
 pypdf
 python-docx
+
