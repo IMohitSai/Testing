@@ -13,12 +13,7 @@ import docx
 
 from src.settings import settings
 from src.agent import Orchestrator
-from pydantic_ai.exceptions import ModelHTTPError
 
-
-# ---------------------------
-# Logging
-# ---------------------------
 logger = logging.getLogger("placementsprint.api")
 logger.setLevel(logging.INFO)
 if not logger.handlers:
@@ -28,7 +23,17 @@ if not logger.handlers:
 
 app = FastAPI(title="PlacementSprint")
 
-orch = Orchestrator(settings)
+
+# ---------------------------
+# Lazy orchestrator (prevents import-time crash)
+# ---------------------------
+_orch: Orchestrator | None = None
+
+def get_orchestrator() -> Orchestrator:
+    global _orch
+    if _orch is None:
+        _orch = Orchestrator(settings)
+    return _orch
 
 
 # ---------------------------
@@ -43,11 +48,9 @@ class ChatRequest(BaseModel):
     mode: Literal["auto", "plan", "resume", "interview"] = "auto"
     messages: list[ChatMessage] = Field(min_length=1)
 
-    def last_user_message(self) -> str:
-        # enforce "last must be user" (your UI expects this)
+    def ensure_last_user(self) -> None:
         if self.messages[-1].role != "user":
             raise ValueError("Last message must be role='user'.")
-        return self.messages[-1].content
 
 
 # ---------------------------
@@ -60,13 +63,14 @@ async def health():
         "service": "placementsprint",
         "model": settings.openrouter_model,
         "fallback_model": settings.openrouter_fallback_model,
+        "has_api_key": bool(settings.openrouter_api_key),
     }
 
 
 # ---------------------------
-# Resume upload helpers
+# Resume Upload
 # ---------------------------
-MAX_RESUME_BYTES = 2 * 1024 * 1024  # 2 MB
+MAX_RESUME_BYTES = 2 * 1024 * 1024  # 2MB
 ALLOWED_RESUME_TYPES = {
     "application/pdf": "pdf",
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "docx",
@@ -74,7 +78,6 @@ ALLOWED_RESUME_TYPES = {
 
 def _clean_text(s: str) -> str:
     s = s.replace("\x00", "").strip()
-    # keep bounded to avoid huge token usage
     if len(s) > 12000:
         s = s[:12000] + "\n\n[Truncated resume text to 12k chars]"
     return s
@@ -82,7 +85,6 @@ def _clean_text(s: str) -> str:
 def _extract_pdf_text(data: bytes) -> str:
     reader = PdfReader(io.BytesIO(data))
     parts: list[str] = []
-    # cap pages for safety
     for page in reader.pages[:12]:
         txt = page.extract_text() or ""
         if txt.strip():
@@ -92,13 +94,11 @@ def _extract_pdf_text(data: bytes) -> str:
 def _extract_docx_text(data: bytes) -> str:
     d = docx.Document(io.BytesIO(data))
     parts: list[str] = []
-    # cap paragraphs for safety
     for p in d.paragraphs[:500]:
         t = (p.text or "").strip()
         if t:
             parts.append(t)
     return "\n".join(parts)
-
 
 @app.post("/api/upload_resume")
 async def upload_resume(file: UploadFile = File(...)):
@@ -106,7 +106,7 @@ async def upload_resume(file: UploadFile = File(...)):
     content_type = (file.content_type or "").strip()
 
     if content_type not in ALLOWED_RESUME_TYPES:
-        raise HTTPException(status_code=415, detail="Unsupported file type. Upload a PDF or DOCX resume.")
+        raise HTTPException(status_code=415, detail="Unsupported file type. Upload PDF or DOCX.")
 
     data = await file.read()
     if not data:
@@ -116,25 +116,21 @@ async def upload_resume(file: UploadFile = File(...)):
 
     try:
         kind = ALLOWED_RESUME_TYPES[content_type]
-        if kind == "pdf":
-            text = _extract_pdf_text(data)
-        else:
-            text = _extract_docx_text(data)
-
+        text = _extract_pdf_text(data) if kind == "pdf" else _extract_docx_text(data)
         text = _clean_text(text)
         if len(text.strip()) < 50:
             raise HTTPException(
                 status_code=422,
-                detail="Could not extract enough text. If this is a scanned PDF, export as text PDF or upload DOCX.",
+                detail="Could not extract enough text. If PDF is scanned, upload DOCX or text-based PDF.",
             )
     except HTTPException:
         raise
     except Exception:
-        logger.exception("resume extraction failed")
-        raise HTTPException(status_code=422, detail="Failed to parse resume file.")
+        logger.exception("resume parsing failed")
+        raise HTTPException(status_code=422, detail="Failed to parse resume.")
 
-    dt_ms = int((time.time() - t0) * 1000)
-    logger.info("resume uploaded kind=%s bytes=%s ms=%s", kind, len(data), dt_ms)
+    ms = int((time.time() - t0) * 1000)
+    logger.info("resume uploaded kind=%s bytes=%s ms=%s", kind, len(data), ms)
 
     return {
         "ok": True,
@@ -146,34 +142,35 @@ async def upload_resume(file: UploadFile = File(...)):
 
 
 # ---------------------------
-# Chat endpoint
+# Chat
 # ---------------------------
 @app.post("/api/chat")
 async def chat(req: ChatRequest, request: Request):
-    vercel_id = request.headers.get("x-vercel-id")
     try:
-        _ = req.last_user_message()
+        req.ensure_last_user()
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
+    vercel_id = request.headers.get("x-vercel-id")
     logger.info("chat start vercel_id=%s mode=%s messages=%d", vercel_id, req.mode, len(req.messages))
+
+    try:
+        orch = get_orchestrator()
+    except ValueError as e:
+        # Missing env vars like OPENROUTER_API_KEY
+        raise HTTPException(status_code=500, detail=str(e))
 
     try:
         out = await orch.respond(req.messages, req.mode)
         return out
-    except ModelHTTPError as e:
-        # surface OpenRouter failures clearly in logs + UI
-        logger.error("openrouter failed vercel_id=%s status=%s body=%s", vercel_id, e.status_code, e.body)
-        msg = e.body.get("message") if isinstance(e.body, dict) else str(e.body)
-        raise HTTPException(status_code=502, detail=f"OpenRouter error {e.status_code}: {msg}")
     except Exception:
         logger.exception("chat failed vercel_id=%s", vercel_id)
-        raise HTTPException(status_code=502, detail="Backend error while generating response.")
+        raise HTTPException(status_code=502, detail="Failed to generate response.")
 
 
 # ---------------------------
 # Local dev only: serve static UI
-# On Vercel, /public is served by the platform (not FastAPI).
+# Vercel serves `public/` automatically.
 # ---------------------------
 if os.getenv("VERCEL") != "1":
     app.mount("/", StaticFiles(directory="public", html=True), name="static")
