@@ -9,12 +9,6 @@ from pydantic_ai import Agent
 from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.openai import OpenAIProvider
 
-try:
-    from pydantic_ai.exceptions import ModelHTTPError
-except Exception:  # very defensive; prevents import-time break if versions vary
-    ModelHTTPError = Exception  # type: ignore
-
-
 logger = logging.getLogger("placementsprint.agent")
 
 
@@ -42,18 +36,11 @@ def _history_to_text(messages: list[dict]) -> str:
 
 
 class Orchestrator:
-    """
-    PydanticAI orchestrator:
-    - Uses Agent(...) (PydanticAI) for generation
-    - Enforces structured output via "strict JSON" + Pydantic validation
-    - Retries & fallback model
-    """
-
     def __init__(self, settings):
         if not settings.openrouter_api_key:
-            raise ValueError("OPENROUTER_API_KEY is missing in environment variables.")
+            raise ValueError("OPENROUTER_API_KEY is missing (set it in Vercel env vars).")
 
-        # IMPORTANT: No `default_headers=` here (your deployed version doesn't support it)
+        # ✅ FIX: no default_headers (your deployed pydantic-ai doesn't accept it)
         provider = OpenAIProvider(
             base_url=settings.openrouter_base_url,
             api_key=settings.openrouter_api_key,
@@ -62,53 +49,48 @@ class Orchestrator:
         self.primary_model = OpenAIChatModel(settings.openrouter_model, provider=provider)
         self.fallback_model = OpenAIChatModel(settings.openrouter_fallback_model, provider=provider)
 
-        # Use plain text output to avoid tool/function-call requirements on OpenRouter routes.
+        # IMPORTANT: output_type=str to avoid tool/function calling on OpenRouter routes
         self.intent_agent_primary = Agent(model=self.primary_model, output_type=str)
         self.intent_agent_fallback = Agent(model=self.fallback_model, output_type=str)
-
         self.main_agent_primary = Agent(model=self.primary_model, output_type=str)
         self.main_agent_fallback = Agent(model=self.fallback_model, output_type=str)
 
-    async def _run_with_retries(self, fn, *, attempts: int = 3):
-        last_err: Exception | None = None
+    async def _run_with_retries(self, fn, attempts: int = 3):
+        last = None
         for i in range(1, attempts + 1):
             try:
                 return await fn()
             except Exception as e:
-                last_err = e
+                last = e
                 wait = 1.5 * i
                 logger.warning("attempt=%s failed: %r; retrying in %.1fs", i, e, wait)
                 await asyncio.sleep(wait)
-        assert last_err is not None
-        raise last_err
+        raise last  # type: ignore
 
     async def _call_text(self, agent: Agent, prompt: str) -> str:
         r = await agent.run(prompt)
-        out = r.data if isinstance(r.data, str) else str(r.data)
-        return out.strip()
+        return (r.data if isinstance(r.data, str) else str(r.data)).strip()
 
     async def classify_intent(self, user_text: str) -> Literal["plan", "resume", "interview"]:
         prompt = (
             "Return ONE WORD ONLY: plan OR resume OR interview.\n"
             "Rules:\n"
-            "- If user asks for day-wise schedule, strategy, or preparation timeline => plan\n"
-            "- If user asks to improve resume, ATS, bullets, tailoring => resume\n"
-            "- If user asks interview Q&A, mock interview, questions => interview\n\n"
+            "- schedule/timeline/strategy => plan\n"
+            "- resume/ATS/bullets/tailor => resume\n"
+            "- interview Q&A/mock => interview\n\n"
             f"USER:\n{user_text}\n"
         )
 
-        async def primary():
-            t = await self._call_text(self.intent_agent_primary, prompt)
-            return t.lower()
+        async def p():
+            return (await self._call_text(self.intent_agent_primary, prompt)).lower()
 
-        async def fallback():
-            t = await self._call_text(self.intent_agent_fallback, prompt)
-            return t.lower()
+        async def f():
+            return (await self._call_text(self.intent_agent_fallback, prompt)).lower()
 
         try:
-            raw = await self._run_with_retries(primary)
+            raw = await self._run_with_retries(p)
         except Exception:
-            raw = await self._run_with_retries(fallback)
+            raw = await self._run_with_retries(f)
 
         if "resume" in raw:
             return "resume"
@@ -116,11 +98,10 @@ class Orchestrator:
             return "interview"
         return "plan"
 
-    def _json_schema_instructions(self) -> str:
-        # Provide an example to increase strict JSON compliance
+    def _schema_instructions(self) -> str:
         return (
-            "Return STRICT JSON ONLY. No markdown, no backticks, no commentary.\n"
-            "JSON schema:\n"
+            "Return STRICT JSON ONLY. No markdown, no backticks.\n"
+            "Schema:\n"
             "{\n"
             '  "reply_markdown": string,\n'
             '  "action_items": [{"title": string, "why": string, "eta_minutes": int, "priority": "low|medium|high"}],\n'
@@ -131,53 +112,41 @@ class Orchestrator:
 
     async def generate(self, messages: list[dict], mode: str) -> AgentResponse:
         latest = messages[-1]["content"]
+
         intent: Literal["plan", "resume", "interview"]
-
-        if mode in ("plan", "resume", "interview"):
-            intent = mode  # type: ignore
-        else:
-            intent = await self.classify_intent(latest)
-
-        system = (
-            "You are PlacementSprint, a practical placement-prep agent.\n"
-            "Be concise, structured, and action-oriented.\n"
-            "If resume text is provided, extract only relevant facts; never paste it fully.\n"
-        )
+        intent = mode if mode in ("plan", "resume", "interview") else await self.classify_intent(latest)  # type: ignore
 
         prompt = (
-            f"{system}\n"
+            "You are PlacementSprint, a practical placement-prep agent. Be concise and actionable.\n"
             f"MODE: {intent}\n\n"
-            f"{self._json_schema_instructions()}\n"
+            f"{self._schema_instructions()}\n"
             "Conversation:\n"
             f"{_history_to_text(messages)}\n"
         )
 
-        async def primary():
+        async def p():
             return await self._call_text(self.main_agent_primary, prompt)
 
-        async def fallback():
+        async def f():
             return await self._call_text(self.main_agent_fallback, prompt)
 
         try:
-            raw = await self._run_with_retries(primary)
+            raw = await self._run_with_retries(p)
         except Exception:
-            raw = await self._run_with_retries(fallback)
+            raw = await self._run_with_retries(f)
 
-        # Parse + validate strict JSON
+        # Parse strict JSON and validate with Pydantic
         try:
-            data = json.loads(raw)
-            return AgentResponse.model_validate(data)
+            return AgentResponse.model_validate(json.loads(raw))
         except (json.JSONDecodeError, ValidationError):
-            # One repair attempt (still using PydanticAI)
-            repair_prompt = (
+            repair = (
                 "Your previous output was invalid.\n"
                 "Fix it and return STRICT JSON ONLY matching the schema.\n\n"
-                f"SCHEMA:\n{self._json_schema_instructions()}\n"
-                f"INVALID_OUTPUT:\n{raw}\n"
+                f"{self._schema_instructions()}\n"
+                f"INVALID:\n{raw}\n"
             )
-            repaired = await self._call_text(self.main_agent_fallback, repair_prompt)
-            data = json.loads(repaired)
-            return AgentResponse.model_validate(data)
+            repaired = await self._call_text(self.main_agent_fallback, repair)
+            return AgentResponse.model_validate(json.loads(repaired))
 
     async def respond(self, messages: list, mode: str) -> dict:
         msg_dicts = [{"role": m.role, "content": m.content} for m in messages]
