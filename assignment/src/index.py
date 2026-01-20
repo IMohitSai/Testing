@@ -2,7 +2,8 @@ import io
 import logging
 import time
 from typing import Literal
-
+from fastapi.staticfiles import StaticFiles
+from pathlib import Path
 from fastapi import FastAPI, HTTPException, UploadFile, File, Request
 from pydantic import BaseModel, Field
 
@@ -142,3 +143,7 @@ async def chat(req: ChatRequest, request: Request):
     except Exception:
         logger.exception("chat failed vercel_id=%s", vercel_id)
         raise HTTPException(502, "LLM call failed. Check OpenRouter model/privacy settings.")
+public_dir = Path(__file__).resolve().parent.parent / "public"
+if public_dir.exists():
+    app.mount("/", StaticFiles(directory=str(public_dir), html=True), name="static")
+
