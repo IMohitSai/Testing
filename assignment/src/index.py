@@ -1,149 +1,182 @@
+from __future__ import annotations
+from fastapi import UploadFile, File
+from pypdf import PdfReader
+import docx
 import io
 import logging
 import time
+from contextlib import asynccontextmanager
 from typing import Literal
+import os
 from fastapi.staticfiles import StaticFiles
-from pathlib import Path
-from fastapi import FastAPI, HTTPException, UploadFile, File, Request
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse, RedirectResponse
 from pydantic import BaseModel, Field
 
-from pypdf import PdfReader
-import docx
+from .agent import AgentResponse, ChatMessage, Mode, build_orchestrator
+from .settings import Settings
 
-from src.settings import settings
-from src.agent import Orchestrator
-
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
 logger = logging.getLogger("placementsprint.api")
-logger.setLevel(logging.INFO)
-if not logger.handlers:
-    h = logging.StreamHandler()
-    h.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s"))
-    logger.addHandler(h)
-
-app = FastAPI(title="PlacementSprint")
-
-# ✅ Lazy init so import never crashes the function
-_orch: Orchestrator | None = None
-def get_orchestrator() -> Orchestrator:
-    global _orch
-    if _orch is None:
-        _orch = Orchestrator(settings)
-    return _orch
-
-
-class ChatMessage(BaseModel):
-    role: Literal["user", "assistant"]
-    content: str = Field(min_length=1, max_length=12000)
 
 
 class ChatRequest(BaseModel):
-    mode: Literal["auto", "plan", "resume", "interview"] = "auto"
-    messages: list[ChatMessage] = Field(min_length=1)
-
-    def ensure_last_user(self):
-        if self.messages[-1].role != "user":
-            raise ValueError("Last message must be role='user'.")
+    mode: Mode = Field(default="auto")
+    messages: list[ChatMessage] = Field(min_length=1, max_length=30)
 
 
-@app.get("/api")
-@app.get("/api/")
-async def api_root():
-    # prevents confusing {"detail":"Not Found"} when you open /api in browser
-    return {"ok": True, "routes": ["/api/health", "/api/upload_resume", "/api/chat"]}
+class ApiError(BaseModel):
+    error: str
+    detail: str | None = None
+    request_id: str | None = None
 
 
-@app.get("/api/health")
-async def health():
-    return {
-        "ok": True,
-        "model": settings.openrouter_model,
-        "fallback_model": settings.openrouter_fallback_model,
-        "has_api_key": bool(settings.openrouter_api_key),
-    }
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Vercel recommends lifespan for startup logic. :contentReference[oaicite:6]{index=6}
+    settings = Settings()
+    app.state.settings = settings
+    app.state.orchestrator = build_orchestrator(settings)
+    logger.info("startup ok (model=%s fallback=%s)", settings.openrouter_model, settings.openrouter_fallback_model)
+    yield
+    logger.info("shutdown")
 
-
-MAX_RESUME_BYTES = 2 * 1024 * 1024
-ALLOWED = {
+MAX_RESUME_BYTES = 2 * 1024 * 1024  # 2 MB
+ALLOWED_RESUME_TYPES = {
     "application/pdf": "pdf",
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "docx",
 }
 
 def _clean_text(s: str) -> str:
     s = s.replace("\x00", "").strip()
+    # Keep it bounded so it doesn't explode tokens
     if len(s) > 12000:
-        s = s[:12000] + "\n\n[Truncated]"
+        s = s[:12000] + "\n\n[Truncated resume text to 12k chars]"
     return s
 
-def _pdf_text(data: bytes) -> str:
+def _extract_pdf_text(data: bytes) -> str:
     reader = PdfReader(io.BytesIO(data))
-    parts = []
-    for page in reader.pages[:12]:
-        t = page.extract_text() or ""
-        if t.strip():
-            parts.append(t)
+    parts: list[str] = []
+    for page in reader.pages[:10]:  # hard cap pages
+        txt = page.extract_text() or ""
+        if txt.strip():
+            parts.append(txt)
     return "\n\n".join(parts)
 
-def _docx_text(data: bytes) -> str:
-    d = docx.Document(io.BytesIO(data))
-    parts = []
-    for p in d.paragraphs[:500]:
+def _extract_docx_text(data: bytes) -> str:
+    doc = docx.Document(io.BytesIO(data))
+    parts: list[str] = []
+    for p in doc.paragraphs[:400]:  # cap paragraphs
         t = (p.text or "").strip()
         if t:
             parts.append(t)
     return "\n".join(parts)
 
+
+app = FastAPI(lifespan=lifespan)
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    request_id = request.headers.get("x-vercel-id") or request.headers.get("x-request-id")
+    logger.exception("unhandled error request_id=%s path=%s", request_id, request.url.path)
+    return JSONResponse(
+        status_code=500,
+        content=ApiError(
+            error="internal_error",
+            detail="Something went wrong. Check logs and try again.",
+            request_id=request_id,
+        ).model_dump(),
+    )
+
+
+@app.get("/", include_in_schema=False)
+async def root():
+    # Static assets live in public/** and are served automatically on Vercel. :contentReference[oaicite:7]{index=7}
+    return RedirectResponse(url="/index.html", status_code=307)
+
 @app.post("/api/upload_resume")
 async def upload_resume(file: UploadFile = File(...)):
     t0 = time.time()
-    ctype = (file.content_type or "").strip()
+    content_type = file.content_type or ""
 
-    if ctype not in ALLOWED:
-        raise HTTPException(415, "Unsupported file type. Upload PDF or DOCX.")
+    if content_type not in ALLOWED_RESUME_TYPES:
+        raise HTTPException(
+            status_code=415,
+            detail="Unsupported file type. Upload a PDF or DOCX resume.",
+        )
 
     data = await file.read()
-    if not data:
-        raise HTTPException(400, "Empty file.")
+    if not data or len(data) == 0:
+        raise HTTPException(status_code=400, detail="Empty file.")
     if len(data) > MAX_RESUME_BYTES:
-        raise HTTPException(413, "File too large. Max 2MB.")
+        raise HTTPException(status_code=413, detail="File too large. Max 2MB.")
 
     try:
-        kind = ALLOWED[ctype]
-        text = _pdf_text(data) if kind == "pdf" else _docx_text(data)
+        kind = ALLOWED_RESUME_TYPES[content_type]
+        if kind == "pdf":
+            text = _extract_pdf_text(data)
+        else:
+            text = _extract_docx_text(data)
+
         text = _clean_text(text)
         if len(text.strip()) < 50:
-            raise HTTPException(422, "Could not extract enough text (scanned PDF?).")
+            raise HTTPException(
+                status_code=422,
+                detail="Could not extract enough text from this file. Try another PDF/DOCX (non-scanned).",
+            )
     except HTTPException:
         raise
     except Exception:
-        logger.exception("resume parse failed")
-        raise HTTPException(422, "Failed to parse resume.")
+        logger.exception("resume extraction failed")
+        raise HTTPException(status_code=422, detail="Failed to parse resume file.")
 
-    logger.info("resume uploaded kind=%s bytes=%s ms=%s", kind, len(data), int((time.time()-t0)*1000))
-    return {"ok": True, "text": text, "chars": len(text)}
+    dt_ms = int((time.time() - t0) * 1000)
+    logger.info("resume uploaded kind=%s bytes=%s ms=%s", kind, len(data), dt_ms)
+
+    return {
+        "ok": True,
+        "filename": file.filename,
+        "content_type": content_type,
+        "text": text,
+        "chars": len(text),
+    }
+
+@app.get("/api/health")
+async def health():
+    return {"ok": True}
 
 
-@app.post("/api/chat")
+@app.post("/api/chat", response_model=AgentResponse)
 async def chat(req: ChatRequest, request: Request):
-    try:
-        req.ensure_last_user()
-    except ValueError as e:
-        raise HTTPException(400, str(e))
+    t0 = time.time()
+    request_id = request.headers.get("x-vercel-id") or request.headers.get("x-request-id")
 
-    vercel_id = request.headers.get("x-vercel-id")
-    logger.info("chat start vercel_id=%s mode=%s messages=%d", vercel_id, req.mode, len(req.messages))
+    # Basic sanity checks
+    if req.messages[-1].role != "user":
+        raise HTTPException(status_code=400, detail="Last message must be role='user'.")
 
-    try:
-        orch = get_orchestrator()
-    except Exception as e:
-        raise HTTPException(500, f"Backend misconfigured: {e}")
+    # Lightweight anti-abuse: reject absurd payloads
+    total_chars = sum(len(m.content) for m in req.messages)
+    if total_chars > 24000:
+        raise HTTPException(status_code=413, detail="Message history too large. Keep it shorter.")
 
+    orch = app.state.orchestrator
     try:
         out = await orch.respond(req.messages, req.mode)
-        return out
-    except Exception:
-        logger.exception("chat failed vercel_id=%s", vercel_id)
-        raise HTTPException(502, "LLM call failed. Check OpenRouter model/privacy settings.")
-public_dir = Path(__file__).resolve().parent.parent / "public"
-if public_dir.exists():
-    app.mount("/", StaticFiles(directory=str(public_dir), html=True), name="static")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except Exception as e:
+        logger.exception("chat failed request_id=%s", request_id)
+        raise HTTPException(status_code=502, detail="Model/provider error. Try again.") from e
 
+    dt_ms = int((time.time() - t0) * 1000)
+    logger.info("chat ok request_id=%s mode=%s ms=%s", request_id, req.mode, dt_ms)
+    return out
+from fastapi.staticfiles import StaticFiles
+if os.getenv("VERCEL") != "1":
+    app.mount("/", StaticFiles(directory="public", html=True), name="static")
+#app.mount("/", StaticFiles(directory="public", html=True), name="static")
