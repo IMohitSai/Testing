@@ -52,33 +52,32 @@ def _build_openrouter_model(settings: Settings, model_id: str) -> OpenAIChatMode
     client = AsyncOpenAI(
         api_key=settings.openrouter_api_key,
         base_url="https://openrouter.ai/api/v1",
-        default_headers=headers or None,
+        default_headers=headers or None,  # OK here (NOT on OpenAIProvider)
     )
     provider = OpenAIProvider(openai_client=client)
     return OpenAIChatModel(model_id, provider=provider)
 
 
 def _extract_json(text: str) -> dict:
-    """Extract a JSON object from model text (handles fenced blocks and extra chatter)."""
+    """
+    Extract a JSON object from model output.
+    Handles:
+      - ```json ... ```
+      - extra chatter before/after the JSON
+    """
     t = (text or "").strip()
 
-    # Prefer ```json ... ```
     if "```" in t:
         parts = t.split("```")
         for i in range(len(parts) - 1):
             if parts[i].strip().lower().endswith("json"):
                 candidate = parts[i + 1].strip()
-                try:
-                    return json.loads(candidate)
-                except Exception:
-                    pass
+                return json.loads(candidate)
 
-    # Fallback: first {...last}
     start = t.find("{")
     end = t.rfind("}")
     if start != -1 and end != -1 and end > start:
-        candidate = t[start : end + 1]
-        return json.loads(candidate)
+        return json.loads(t[start : end + 1])
 
     raise ValueError("No JSON object found in model output")
 
@@ -116,15 +115,17 @@ class Orchestrator:
 
     async def _call_model(self, *, prompt: str, use_fallback: bool) -> AgentResponse:
         agent = self.main_agent_fallback if use_fallback else self.main_agent_primary
+
+        # PydanticAI run returns an object with `.output` in your current codebase.
         raw = (await agent.run(prompt)).output
 
         try:
             obj = _extract_json(raw)
             return _validate_agent_response(obj)
-        except (json.JSONDecodeError, ValidationError, ValueError) as e:
-            # One repair attempt (same agent)
+        except (json.JSONDecodeError, ValidationError, ValueError):
+            # One repair attempt
             repair_prompt = (
-                "You returned invalid JSON.\n"
+                "Your previous output was invalid.\n"
                 "Return ONLY a single JSON object matching this schema:\n"
                 "{"
                 '"reply_markdown": string,'
@@ -132,7 +133,11 @@ class Orchestrator:
                 '"follow_up_questions": [string],'
                 '"warnings": [string]'
                 "}\n"
-                "No markdown fences. No extra keys. No extra text.\n\n"
+                "Rules:\n"
+                "- Valid JSON only\n"
+                "- Double quotes only\n"
+                "- No markdown fences\n"
+                "- No extra keys\n\n"
                 f"INVALID_OUTPUT:\n{raw}"
             )
             raw2 = (await agent.run(repair_prompt)).output
@@ -143,30 +148,36 @@ class Orchestrator:
         if not messages or messages[-1].role != "user":
             raise ValueError("Last message must be from the user.")
 
-        resolved_mode = mode
-
+        # We keep "auto" mode but do it via instruction (no separate classifier call).
         system_context = (
             "You are PlacementSprint, a practical placement-prep agent.\n"
             "Be concise, structured, and action-oriented.\n"
             "If the prompt contains a section starting with 'RESUME_CONTEXT:' treat it as the user's resume text.\n"
-            "Do not repeat the resume verbatim; extract only relevant facts.\n"
-            "You MUST output ONLY JSON (one object) with keys: reply_markdown, action_items, follow_up_questions, warnings.\n"
-            "Use double quotes and valid JSON. No trailing commas. No markdown fences.\n"
+            "Do not repeat the resume verbatim; extract only relevant facts.\n\n"
+            "You MUST output ONLY JSON (one object) with keys:\n"
+            "- reply_markdown (string)\n"
+            "- action_items (array)\n"
+            "- follow_up_questions (array)\n"
+            "- warnings (array)\n\n"
+            "No markdown fences. No extra text. No extra keys.\n"
         )
 
         mode_instruction = {
-            "plan": "Make a timeboxed plan (today + next 7 days). Include action_items.",
-            "resume": "Improve resume bullets; provide 4-8 rewritten bullets and 3 concrete fixes.",
-            "interview": "Generate interview prep: 10 questions + what a strong answer includes.",
-            "auto": "Decide whether plan/resume/interview is best, then proceed with that.",
-        }[resolved_mode]
+            "plan": "Generate a timeboxed plan (today + next 7 days). Include action_items.",
+            "resume": "Rewrite 4-8 strong resume bullets with metrics + give 3 concrete resume fixes.",
+            "interview": "Generate 10 interview questions + what a strong answer includes. Include action_items.",
+            "auto": (
+                "First decide the best mode: plan/resume/interview.\n"
+                "Then do it. If missing info, ask focused follow-ups."
+            ),
+        }[mode]
 
         history = _format_history(messages)
         latest = messages[-1].content.strip()
 
         prompt = (
             f"{system_context}\n"
-            f"MODE: {resolved_mode}\n"
+            f"MODE: {mode}\n"
             f"MODE_INSTRUCTION: {mode_instruction}\n\n"
             "CONVERSATION_HISTORY:\n"
             f"{history}\n\n"
@@ -193,15 +204,16 @@ def build_orchestrator(settings: Settings) -> Orchestrator:
     primary_model = _build_openrouter_model(settings, settings.openrouter_model)
     fallback_model = _build_openrouter_model(settings, settings.openrouter_fallback_model)
 
+    # KEY: output_type=str to avoid tool/function calling routes on OpenRouter.
     main_agent_primary = Agent(
         model=primary_model,
         instructions="You are PlacementSprint.",
-        output_type=str,  # IMPORTANT: avoids tool/function calling
+        output_type=str,
     )
     main_agent_fallback = Agent(
         model=fallback_model,
         instructions="You are PlacementSprint.",
-        output_type=str,  # IMPORTANT: avoids tool/function calling
+        output_type=str,
     )
 
     return Orchestrator(
