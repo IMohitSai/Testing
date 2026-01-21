@@ -6,10 +6,11 @@ import os
 import time
 import asyncio
 from pathlib import Path
+from typing import Optional
 
 import docx
-from fastapi import FastAPI, File, HTTPException, Request, UploadFile
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, HTTPException, Request, UploadFile, File
+from fastapi.responses import JSONResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from pypdf import PdfReader
@@ -37,7 +38,7 @@ class ApiError(BaseModel):
 
 app = FastAPI()
 
-# ---- Lazy singletons (safe for Vercel cold starts) ----
+# ---- Lazy singletons (NO import-time heavy work) ----
 _settings: Settings | None = None
 _orch = None
 _orch_lock = asyncio.Lock()
@@ -62,7 +63,7 @@ async def get_orchestrator():
     return _orch
 
 
-# ---- Error handling ----
+# ---- Errors (never crash the function without JSON) ----
 @app.exception_handler(Exception)
 async def unhandled_exception_handler(request: Request, exc: Exception):
     request_id = request.headers.get("x-vercel-id") or request.headers.get("x-request-id")
@@ -151,10 +152,7 @@ async def upload_resume(file: UploadFile = File(...)):
         text = _extract_pdf_text(data) if kind == "pdf" else _extract_docx_text(data)
         text = _clean_text(text)
         if len(text.strip()) < 50:
-            raise HTTPException(
-                status_code=422,
-                detail="Could not extract enough text. Try a non-scanned PDF/DOCX.",
-            )
+            raise HTTPException(status_code=422, detail="Could not extract enough text. Try a non-scanned PDF/DOCX.")
     except HTTPException:
         raise
     except Exception:
@@ -162,7 +160,7 @@ async def upload_resume(file: UploadFile = File(...)):
         raise HTTPException(status_code=422, detail="Failed to parse resume file.")
 
     dt_ms = int((time.time() - t0) * 1000)
-    logger.info("resume uploaded kind=%s bytes=%s ms=%s", ALLOWED_RESUME_TYPES[content_type], len(data), dt_ms)
+    logger.info("resume uploaded kind=%s bytes=%s ms=%s", kind, len(data), dt_ms)
 
     return {
         "ok": True,
@@ -178,7 +176,7 @@ async def chat(req: ChatRequest, request: Request):
     t0 = time.time()
     request_id = request.headers.get("x-vercel-id") or request.headers.get("x-request-id")
 
-    if req.messages[-1].role != "user":
+    if not req.messages or req.messages[-1].role != "user":
         raise HTTPException(status_code=400, detail="Last message must be role='user'.")
 
     total_chars = sum(len(m.content) for m in req.messages)
@@ -190,17 +188,41 @@ async def chat(req: ChatRequest, request: Request):
         out = await orch.respond(req.messages, req.mode)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
-    except Exception as e:
-        # Provider/model/privacy errors should not crash the function
+    except Exception:
+        # provider/model/privacy problems should return a clean 502, not crash the function
         logger.exception("chat failed request_id=%s", request_id)
-        raise HTTPException(status_code=502, detail="Model/provider error. Try again or switch model.") from e
+        raise HTTPException(status_code=502, detail="Model/provider error. Try again or switch model.")
 
     dt_ms = int((time.time() - t0) * 1000)
     logger.info("chat ok request_id=%s mode=%s ms=%s", request_id, req.mode, dt_ms)
     return out
 
 
-# ---- Serve OLD frontend at `/` from public/ (Vercel + local) ----
-BASE_DIR = Path(__file__).resolve().parents[1]  # repo root
-PUBLIC_DIR = BASE_DIR / "public"
-app.mount("/", StaticFiles(directory=str(PUBLIC_DIR), html=True), name="public")
+# ---- Static serving for OLD frontend (crash-proof) ----
+def _find_public_dir() -> Optional[Path]:
+    # Try multiple candidates to survive Root Directory differences on Vercel
+    candidates = [
+        Path(__file__).resolve().parents[1] / "public",  # repo_root/public if src/index.py
+        Path.cwd() / "public",
+        Path(__file__).resolve().parents[2] / "public",  # one level higher (just in case)
+    ]
+    for c in candidates:
+        if c.exists() and c.is_dir():
+            return c
+    return None
+
+
+PUBLIC_DIR = _find_public_dir()
+if PUBLIC_DIR is not None:
+    # IMPORTANT: mount AFTER /api routes so /api/* still matches first
+    app.mount("/", StaticFiles(directory=str(PUBLIC_DIR), html=True), name="public")
+    logger.info("serving static from %s", str(PUBLIC_DIR))
+else:
+    # Don't crash if public is missing (shows a useful message instead of 500 crash loop)
+    @app.get("/", include_in_schema=False)
+    async def root_missing_public():
+        return HTMLResponse(
+            "<h2>Deployment issue: public/ directory not found</h2>"
+            "<p>Fix Vercel Root Directory or ensure public/ is committed in the deployed root.</p>",
+            status_code=500,
+        )
